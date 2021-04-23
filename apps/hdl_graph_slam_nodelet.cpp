@@ -12,6 +12,7 @@
 #include <boost/filesystem.hpp>
 #include <boost/algorithm/string.hpp>
 #include <Eigen/Dense>
+#include <Eigen/Geometry>
 #include <pcl/io/pcd_io.h>
 
 #include <ros/ros.h>
@@ -66,7 +67,7 @@ public:
   typedef pcl::PointXYZI PointT;
   typedef message_filters::sync_policies::ApproximateTime<nav_msgs::Odometry, sensor_msgs::PointCloud2> ApproxSyncPolicy;
 
-  HdlGraphSlamNodelet() {}
+  HdlGraphSlamNodelet(): cloud_ (new pcl::PointCloud<PointT>) {}
   virtual ~HdlGraphSlamNodelet() {}
 
   virtual void onInit() {
@@ -79,6 +80,7 @@ public:
     odom_frame_id = private_nh.param<std::string>("odom_frame_id", "odom");
     map_cloud_resolution = private_nh.param<double>("map_cloud_resolution", 0.05);
     trans_odom2map.setIdentity();
+    t_prev_.setIdentity();
 
     max_keyframes_per_update = private_nh.param<int>("max_keyframes_per_update", 10);
 
@@ -145,6 +147,21 @@ private:
   void cloud_callback(const nav_msgs::OdometryConstPtr& odom_msg, const sensor_msgs::PointCloud2::ConstPtr& cloud_msg) {
     const ros::Time& stamp = cloud_msg->header.stamp;
     Eigen::Isometry3d odom = odom2isometry(odom_msg);
+    
+    // auto t = Eigen::Transform<double, 3, Eigen::Affine>(odom.affine());
+    auto t = Eigen::Transform<double, 3, Eigen::Affine>(odom.affine());
+    Eigen::Affine3d t_diff;
+    if (imu_queue.size() > 0)
+    {
+      auto q_msg = imu_queue.back()->orientation;
+      auto q_eigen = Eigen::Quaterniond(q_msg.w, q_msg.x, q_msg.y, q_msg.z); // TRYING TO FIX SCAN ORIENTATION, BECAUSE ODOM IS only 3D not 6D
+      t_diff = q_eigen.inverse() * (t.inverse() * t_prev_);
+    }
+    else {
+      t_diff = t.inverse() * t_prev_;
+    }
+    
+    t_prev_ = t;
 
     pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());
     pcl::fromROSMsg(*cloud_msg, *cloud);
@@ -154,6 +171,8 @@ private:
 
     if(!keyframe_updater->update(odom)) {
       std::lock_guard<std::mutex> lock(keyframe_queue_mutex);
+      pcl::transformPointCloud(*cloud_, *cloud_, t_diff);
+      *cloud_ += *cloud;
       if(keyframe_queue.empty()) {
         std_msgs::Header read_until;
         read_until.stamp = stamp + ros::Duration(10, 0);
@@ -166,11 +185,15 @@ private:
       return;
     }
 
-    double accum_d = keyframe_updater->get_accum_distance();
-    KeyFrame::Ptr keyframe(new KeyFrame(stamp, odom, accum_d, cloud));
-
     std::lock_guard<std::mutex> lock(keyframe_queue_mutex);
+    
+    pcl::transformPointCloud(*cloud_, *cloud_, t_diff);
+    *cloud_ += *cloud;
+    double accum_d = keyframe_updater->get_accum_distance();
+    KeyFrame::Ptr keyframe(new KeyFrame(stamp, odom, accum_d, cloud_));
+
     keyframe_queue.push_back(keyframe);
+    cloud_ = empty_cloud_.makeShared();
   }
 
   /**
@@ -959,6 +982,10 @@ private:
   std::mutex keyframes_snapshot_mutex;
   std::vector<KeyFrameSnapshot::Ptr> keyframes_snapshot;
   std::unique_ptr<MapCloudGenerator> map_cloud_generator;
+
+  pcl::PointCloud<PointT>::Ptr cloud_;
+  pcl::PointCloud<PointT> empty_cloud_;
+  Eigen::Transform<double, 3, Eigen::Affine> t_prev_;
 
   // graph slam
   // all the below members must be accessed after locking main_thread_mutex

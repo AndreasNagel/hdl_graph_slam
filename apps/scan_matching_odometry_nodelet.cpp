@@ -14,6 +14,7 @@
 #include <std_msgs/Time.h>
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/Imu.h>
 #include <geometry_msgs/TransformStamped.h>
 #include <geometry_msgs/PoseWithCovarianceStamped.h>
 
@@ -35,7 +36,7 @@ public:
   typedef pcl::PointXYZI PointT;
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-  ScanMatchingOdometryNodelet() {}
+  ScanMatchingOdometryNodelet() : new_keyframe (new pcl::PointCloud<PointT>), keyframe (new pcl::PointCloud<PointT>) {}
   virtual ~ScanMatchingOdometryNodelet() {}
 
   virtual void onInit() {
@@ -51,6 +52,8 @@ public:
     }
 
     points_sub = nh.subscribe("/filtered_points", 256, &ScanMatchingOdometryNodelet::cloud_callback, this);
+    robot_odom_sub = nh.subscribe("/robot_odom", 256, &ScanMatchingOdometryNodelet::odom_callback, this);
+
     read_until_pub = nh.advertise<std_msgs::Header>("/scan_matching_odometry/read_until", 32);
     odom_pub = nh.advertise<nav_msgs::Odometry>("/odom", 32);
     trans_pub = nh.advertise<geometry_msgs::TransformStamped>("/scan_matching_odometry/transform", 32);
@@ -106,19 +109,99 @@ private:
   }
 
   /**
-   * @brief callback for point clouds
-   * @param cloud_msg  point cloud msg
+   * @brief callback for imu
+   * @param imu_msg imu message
    */
+  void imu_callback(const sensor_msgs::ImuConstPtr imu_msg) {
+    imu_ = imu_msg;
+  }
+
+
   void cloud_callback(const sensor_msgs::PointCloud2ConstPtr& cloud_msg) {
     if(!ros::ok()) {
       return;
     }
-
+    ROS_ERROR_STREAM("Got a cloud");
     pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());
     pcl::fromROSMsg(*cloud_msg, *cloud);
 
-    Eigen::Matrix4f pose = matching(cloud_msg->header.stamp, cloud);
-    publish_odometry(cloud_msg->header.stamp, cloud_msg->header.frame_id, pose);
+    if (!new_keyframe || new_keyframe->size() == 0) {
+      ROS_ERROR_STREAM("making new kf");
+      *new_keyframe = *downsample(cloud); // make sure, that header stamp is in new keyframe ******
+      prev_cloud_stamp = cloud_msg->header.stamp;
+      kf_start_stamp = cloud_msg->header.stamp;
+      return;
+    }
+    // Eigen::Matrix4f pose = matching(cloud_msg->header.stamp, cloud);
+    // get odometry estimation between this and last cloud
+    // pose change from last CLOUD to this CLOUD (not keyframe)
+    tf::StampedTransform transform;
+    auto cloud_frame = cloud_msg->header.frame_id;
+    auto cloud_time = cloud_msg->header.stamp;
+    // get transform between prev_cloud_stamp and current cloud stamp
+    if(tf_listener.waitForTransform(cloud_frame, cloud_time, cloud_frame, prev_cloud_stamp, robot_odom_frame_id, ros::Duration(0))) {
+      tf_listener.lookupTransform(cloud->header.frame_id, cloud_time, cloud->header.frame_id, prev_cloud_stamp, robot_odom_frame_id, transform);
+    // If cant find it, get the transform from prev_cloud_stamp to most recent tf
+    } else if(tf_listener.waitForTransform(cloud->header.frame_id, ros::Time(0), cloud->header.frame_id, prev_cloud_stamp, robot_odom_frame_id, ros::Duration(0))) {
+      tf_listener.lookupTransform(cloud->header.frame_id, ros::Time(0), cloud->header.frame_id, prev_cloud_stamp, robot_odom_frame_id, transform);
+    }
+
+    prev_cloud_stamp = cloud_msg->header.stamp;
+    Eigen::Affine3f t_diff_cloud = tf2isometry(transform).cast<float>();
+
+    // collect readings from over 0.5 seconds
+    // try to match with readings over next 0.5 seconds
+    pcl::transformPointCloud(*new_keyframe, *new_keyframe, t_diff_cloud);
+    *new_keyframe += *cloud;
+    keyframe_pose = t_diff_cloud * keyframe_pose;
+    new_keyframe->header.stamp = cloud->header.stamp;
+
+    ROS_ERROR_STREAM("checking if need save cloud" << cloud_msg->header.stamp - ros::Time(kf_start_stamp));
+    ROS_ERROR_STREAM("checking if need save cloud" << cloud_msg->header.stamp << "   ;   " << kf_start_stamp);
+    // set a keyframe_window_start
+    // check if keyframe is still not large enough and needs updating
+    if (cloud_msg->header.stamp - kf_start_stamp < ros::Duration(0.5))
+    {
+      return;
+    }
+
+    //if have new keyframe with 0.5 sec readings
+    // no old keyframe to compare to
+    if (!keyframe || keyframe->size() == 0)
+    {
+      keyframe = new_keyframe;
+      new_keyframe = empty_cloud_.makeShared();
+      registration->setInputTarget(keyframe);
+      return;
+    }
+
+    // if new keyframe full and have old keyframe to compare to
+
+    ROS_ERROR_STREAM("aligning");
+    registration->align(*new_keyframe, keyframe_pose);
+    Eigen::Isometry3f guess_print;
+    guess_print.linear() = keyframe_pose.block<3,3>(0,0);
+    guess_print.translation() = keyframe_pose.block<3,1>(0,3);
+    publish_scan_matching_status(ros::Time(new_keyframe->header.stamp), new_keyframe->header.frame_id, new_keyframe, "odom&imu_source", guess_print);
+
+    if(!registration->hasConverged()) {
+      NODELET_INFO_STREAM("scan matching has not converged!!");
+      NODELET_INFO_STREAM("ignore this frame(" << new_keyframe->header.stamp << ")");
+      publish_odometry_tf(cloud_msg->header.stamp, robot_odom_frame_id, Eigen::Matrix4f::Identity());
+    } else 
+    {
+      trans_correction = registration->getFinalTransformation();
+      // publish tf around every dt for gathering keypoints and publish odometry whenever new odometry is published
+      publish_odometry_tf(cloud_msg->header.stamp, robot_odom_frame_id, trans_correction);
+    }
+
+
+    // RESET KEYFRAME
+    new_keyframe->header.stamp = cloud->header.stamp;
+    keyframe = new_keyframe;
+    new_keyframe = empty_cloud_.makeShared();
+    new_keyframe->header.stamp = cloud->header.stamp;
+    registration->setInputTarget(keyframe);
 
     // In offline estimation, point clouds until the published time will be supplied
     std_msgs::HeaderPtr read_until(new std_msgs::Header());
@@ -156,111 +239,6 @@ private:
   }
 
   /**
-   * @brief estimate the relative pose between an input cloud and a keyframe cloud
-   * @param stamp  the timestamp of the input cloud
-   * @param cloud  the input cloud
-   * @return the relative pose between the input cloud and the keyframe cloud
-   */
-  Eigen::Matrix4f matching(const ros::Time& stamp, const pcl::PointCloud<PointT>::ConstPtr& cloud) {
-    if(!keyframe) {
-      prev_time = ros::Time();
-      prev_trans.setIdentity();
-      keyframe_pose.setIdentity();
-      keyframe_stamp = stamp;
-      keyframe = downsample(cloud);
-      registration->setInputTarget(keyframe);
-      return Eigen::Matrix4f::Identity();
-    }
-
-    auto filtered = downsample(cloud);
-    registration->setInputSource(filtered);
-
-    std::string msf_source;
-    Eigen::Isometry3f msf_delta = Eigen::Isometry3f::Identity();
-
-    if(private_nh.param<bool>("enable_imu_frontend", false)) {
-      if(msf_pose && msf_pose->header.stamp > keyframe_stamp && msf_pose_after_update && msf_pose_after_update->header.stamp > keyframe_stamp) {
-        Eigen::Isometry3d pose0 = pose2isometry(msf_pose_after_update->pose.pose);
-        Eigen::Isometry3d pose1 = pose2isometry(msf_pose->pose.pose);
-        Eigen::Isometry3d delta = pose0.inverse() * pose1;
-
-        msf_source = "imu";
-        msf_delta = delta.cast<float>();
-      } else {
-        std::cerr << "msf data is too old" << std::endl;
-      }
-    } else if(private_nh.param<bool>("enable_robot_odometry_init_guess", false) && !prev_time.isZero()) {
-      tf::StampedTransform transform;
-      if(tf_listener.waitForTransform(cloud->header.frame_id, stamp, cloud->header.frame_id, prev_time, robot_odom_frame_id, ros::Duration(0))) {
-        tf_listener.lookupTransform(cloud->header.frame_id, stamp, cloud->header.frame_id, prev_time, robot_odom_frame_id, transform);
-      } else if(tf_listener.waitForTransform(cloud->header.frame_id, ros::Time(0), cloud->header.frame_id, prev_time, robot_odom_frame_id, ros::Duration(0))) {
-        tf_listener.lookupTransform(cloud->header.frame_id, ros::Time(0), cloud->header.frame_id, prev_time, robot_odom_frame_id, transform);
-      }
-
-      if(transform.stamp_.isZero()) {
-        NODELET_WARN_STREAM("failed to look up transform between " << cloud->header.frame_id << " and " << robot_odom_frame_id);
-      } else {
-        msf_source = "odometry";
-        msf_delta = tf2isometry(transform).cast<float>();
-      }
-    }
-
-    pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
-    registration->align(*aligned, prev_trans * msf_delta.matrix());
-
-    publish_scan_matching_status(stamp, cloud->header.frame_id, aligned, msf_source, msf_delta);
-
-    if(!registration->hasConverged()) {
-      NODELET_INFO_STREAM("scan matching has not converged!!");
-      NODELET_INFO_STREAM("ignore this frame(" << stamp << ")");
-      return keyframe_pose * prev_trans;
-    }
-
-    Eigen::Matrix4f trans = registration->getFinalTransformation();
-    Eigen::Matrix4f odom = keyframe_pose * trans;
-
-    if(transform_thresholding) {
-      Eigen::Matrix4f delta = prev_trans.inverse() * trans;
-      double dx = delta.block<3, 1>(0, 3).norm();
-      double da = std::acos(Eigen::Quaternionf(delta.block<3, 3>(0, 0)).w());
-
-      if(dx > max_acceptable_trans || da > max_acceptable_angle) {
-        NODELET_INFO_STREAM("too large transform!!  " << dx << "[m] " << da << "[rad]");
-        NODELET_INFO_STREAM("ignore this frame(" << stamp << ")");
-        return keyframe_pose * prev_trans;
-      }
-    }
-
-    prev_time = stamp;
-    prev_trans = trans;
-
-    auto keyframe_trans = matrix2transform(stamp, keyframe_pose, odom_frame_id, "keyframe");
-    keyframe_broadcaster.sendTransform(keyframe_trans);
-
-    double delta_trans = trans.block<3, 1>(0, 3).norm();
-    double delta_angle = std::acos(Eigen::Quaternionf(trans.block<3, 3>(0, 0)).w());
-    double delta_time = (stamp - keyframe_stamp).toSec();
-    if(delta_trans > keyframe_delta_trans || delta_angle > keyframe_delta_angle || delta_time > keyframe_delta_time) {
-      keyframe = filtered;
-      registration->setInputTarget(keyframe);
-
-      keyframe_pose = odom;
-      keyframe_stamp = stamp;
-      prev_time = stamp;
-      prev_trans.setIdentity();
-    }
-
-    if (aligned_points_pub.getNumSubscribers() > 0)
-    {
-      pcl::transformPointCloud (*cloud, *aligned, odom);
-      aligned->header.frame_id=odom_frame_id;
-      aligned_points_pub.publish(aligned);
-    }
-
-    return odom;
-  }
-
-  /**
    * @brief publish odometry
    * @param stamp  timestamp
    * @param pose   odometry pose to be published
@@ -288,6 +266,45 @@ private:
     odom.twist.twist.linear.y = 0.0;
     odom.twist.twist.angular.z = 0.0;
 
+    odom_pub.publish(odom);
+  }
+  /**
+   * @brief publish odometry
+   * @param stamp  timestamp
+   * @param pose   odometry pose to be published
+   */
+  void publish_odometry_tf(const ros::Time& stamp, const std::string& base_frame_id, const Eigen::Matrix4f& pose) {
+    // publish transform stamped for IMU integration
+    geometry_msgs::TransformStamped odom_trans = matrix2transform(stamp, pose, odom_frame_id, base_frame_id);
+    trans_pub.publish(odom_trans);
+
+    // broadcast the transform over tf
+    odom_broadcaster.sendTransform(odom_trans);
+  }
+
+  void odom_callback(const nav_msgs::OdometryConstPtr odom_msg)
+  {
+    nav_msgs::Odometry odom = *odom_msg;
+
+    Eigen::Quaterniond r_scan(trans_correction.block<3, 3>(0, 0).cast<double>());
+    
+    auto r = r_scan * msgq2eigenq(odom.pose.pose.orientation); // ******
+    
+    r.normalize();
+    
+    odom.header.stamp = odom_msg->header.stamp;
+    odom.header.frame_id = odom_frame_id;
+
+    odom.pose.pose.position.x += trans_correction(0, 3);
+    odom.pose.pose.position.y += trans_correction(1, 3);
+    odom.pose.pose.position.z += trans_correction(2, 3);
+    odom.pose.pose.orientation = eigenq2msgq(r); // *******
+    // odom.pose.pose.orientation *= quat;
+
+    odom.child_frame_id = odom_frame_id;
+    odom.twist.twist.linear.x = 0.0;
+    odom.twist.twist.linear.y = 0.0;
+    odom.twist.twist.angular.z = 0.0;
     odom_pub.publish(odom);
   }
 
@@ -339,6 +356,7 @@ private:
   ros::NodeHandle private_nh;
 
   ros::Subscriber points_sub;
+  ros::Subscriber robot_odom_sub;
   ros::Subscriber msf_pose_sub;
   ros::Subscriber msf_pose_after_update_sub;
 
@@ -369,11 +387,17 @@ private:
   geometry_msgs::PoseWithCovarianceStampedConstPtr msf_pose;
   geometry_msgs::PoseWithCovarianceStampedConstPtr msf_pose_after_update;
 
-  ros::Time prev_time;
+  sensor_msgs::ImuConstPtr imu_;
+
+  ros::Time prev_cloud_stamp;
+  ros::Time kf_start_stamp;
   Eigen::Matrix4f prev_trans;                  // previous estimated transform from keyframe
   Eigen::Matrix4f keyframe_pose;               // keyframe pose
+  Eigen::Matrix4f trans_correction;               // keyframe pose
   ros::Time keyframe_stamp;                    // keyframe time
-  pcl::PointCloud<PointT>::ConstPtr keyframe;  // keyframe point cloud
+  pcl::PointCloud<PointT> empty_cloud_;  // keyframe point cloud
+  pcl::PointCloud<PointT>::Ptr keyframe;  // keyframe point cloud
+  pcl::PointCloud<PointT>::Ptr new_keyframe;  // keyframe point cloud
 
   //
   pcl::Filter<PointT>::Ptr downsample_filter;

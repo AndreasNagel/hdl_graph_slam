@@ -42,6 +42,20 @@ static geometry_msgs::TransformStamped matrix2transform(const ros::Time& stamp, 
   return odom_trans;
 }
 
+static geometry_msgs::Quaternion eigenq2msgq(Eigen::Quaterniond eq) {
+  geometry_msgs::Quaternion q_msg;
+  q_msg.w = eq.w();
+  q_msg.x = eq.x();
+  q_msg.y = eq.y();
+  q_msg.z = eq.z();
+  return q_msg;
+}
+
+static Eigen::Quaterniond msgq2eigenq(geometry_msgs::Quaternion eq) {
+  Eigen::Quaterniond q_msg(eq.w, eq.x, eq.y, eq.z);
+  return q_msg;
+}
+
 static Eigen::Isometry3d pose2isometry(const geometry_msgs::Pose& pose) {
   Eigen::Isometry3d mat = Eigen::Isometry3d::Identity();
   mat.translation() = Eigen::Vector3d(pose.position.x, pose.position.y, pose.position.z);
