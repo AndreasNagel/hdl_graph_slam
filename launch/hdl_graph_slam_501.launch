@@ -9,11 +9,13 @@
 
   <arg name="points_topic" default="/point_cloud" />
   <arg name="map_frame_id" default="map" />
-  <arg name="lidar_odom_frame_id" default="odom" />
+  <!-- <arg name="lidar_odom_frame_id" default="odom" /> -->
+  <arg name="lidar_odom_frame_id" default="lidar_odom" />
 
   <!-- optional arguments -->
   <arg name="enable_robot_odometry_init_guess" default="true" />
-  <arg name="robot_odom_frame_id" default="robot_odom" />
+  <arg name="robot_odom_frame_id" default="odom" />
+  <!-- <arg name="robot_odom_frame_id" default="robot_odom" /> -->
 
   <!-- transformation between lidar and base_link -->
   <node pkg="tf" type="static_transform_publisher" name="lidar2base_publisher" args="0 0 0 0 0 0 base_link velodyne 10" />
@@ -83,7 +85,7 @@
   <!-- hdl_graph_slam_nodelet -->
   <node pkg="nodelet" type="nodelet" name="hdl_graph_slam_nodelet" args="load hdl_graph_slam/HdlGraphSlamNodelet $(arg nodelet_manager)">
     <param name="points_topic" value="$(arg points_topic)" />
-    <param name="ndt_resolution" value="0.01" />
+    <param name="ndt_resolution" value="0.02" />
     <!-- frame settings -->
     <param name="map_frame_id" value="$(arg map_frame_id)" />
     <param name="odom_frame_id" value="odom" />
@@ -98,8 +100,8 @@
     <param name="enable_imu_orientation" value="$(arg enable_imu_ori)" />
     <!-- keyframe registration params --> <!-- Keyframes combine to make a *temporary* map, that will be compared to the full map. Gather them often and many to make good comparisons?-->
     <param name="max_keyframes_per_update" value="50" />
-    <param name="keyframe_delta_trans" value="0.5" />
-    <param name="keyframe_delta_angle" value="0.5" />
+    <param name="keyframe_delta_trans" value="0.01" />
+    <param name="keyframe_delta_angle" value="0.05" />
     <!-- <param name="keyframe_delta_trans" value="0.01" />
     <param name="keyframe_delta_angle" value="0.08" /> -->
     <!-- fix first node for optimization stability -->
@@ -107,15 +109,15 @@
     <param name="fix_first_node_stddev" value="10 10 10 1 1 1"/>
     <param name="fix_first_node_adaptive" value="true"/>
     <!-- loop closure params -->
-    <param name="distance_thresh" value="1.0" /> <!-- max distance for a loop closure match point -->
-    <param name="accum_distance_thresh" value="1.0" /> <!-- distance driven, after which to perform loop closure -->
+    <param name="distance_thresh" value="2.0" /> <!-- max distance for a loop closure match point -->
+    <param name="accum_distance_thresh" value="0.1" /> <!-- distance driven, after which to perform loop closure -->
     <param name="min_edge_interval" value="0.1" />
-    <param name="fitness_score_thresh" value="0.005" /> <!-- The lower the score the better the match (it is mean euclidean distance between points in map and points in new cloud)-->
+    <param name="fitness_score_thresh" value="0.8" /> <!-- The lower the score the better the match (it is mean euclidean distance between points in map and points in new cloud)-->
     <!-- scan matching params -->
     <!-- <param name="registration_method" value="FAST_GICP" /> -->
     <param name="registration_method" value="NDT_OMP" />
     <param name="reg_num_threads" value="1" />
-    <param name="reg_transformation_epsilon" value="0.1"/>
+    <param name="reg_transformation_epsilon" value="0.01"/>
     <param name="reg_maximum_iterations" value="64"/>
     <param name="reg_max_correspondence_distance" value="2.0"/>
     <param name="reg_max_optimizer_iterations" value="20"/>
@@ -153,7 +155,7 @@
     <param name="min_stddev_q" value="0.05" />
     <param name="max_stddev_q" value="0.2" />
     <!-- update params -->
-    <param name="graph_update_interval" value="1.5" />
+    <param name="graph_update_interval" value="1.5" /> <!-- how often to run the pose graph optimizer-->
     <param name="map_cloud_update_interval" value="1.0" />
     <param name="map_cloud_resolution" value="0.01" />
   </node>
