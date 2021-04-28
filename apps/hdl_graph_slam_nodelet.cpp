@@ -151,7 +151,7 @@ private:
     // auto t = Eigen::Transform<double, 3, Eigen::Affine>(odom.affine());
     auto t = Eigen::Transform<double, 3, Eigen::Affine>(odom.affine());
     Eigen::Affine3d t_diff;
-    if (imu_queue.size() > 0)
+    if (enable_imu_orientation && imu_queue.size() > 0)
     {
       auto q_msg = imu_queue.back()->orientation;
       auto q_eigen = Eigen::Quaterniond(q_msg.w, q_msg.x, q_msg.y, q_msg.z); // TRYING TO FIX SCAN ORIENTATION, BECAUSE ODOM IS only 3D not 6D

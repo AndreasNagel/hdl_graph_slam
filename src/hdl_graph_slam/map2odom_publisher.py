@@ -35,7 +35,10 @@ def main():
 	rate = rospy.Rate(10.0)
 	while not rospy.is_shutdown():
 		node.spin()
-		rate.sleep()
+		try:
+			rate.sleep()
+		except:
+			rospy.logwarn("sleep failed for map2odom")
 
 if __name__ == '__main__':
 	main()
