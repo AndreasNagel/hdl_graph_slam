@@ -145,6 +145,14 @@ private:
    * @param cloud_msg
    */
   void cloud_callback(const nav_msgs::OdometryConstPtr& odom_msg, const sensor_msgs::PointCloud2::ConstPtr& cloud_msg) {
+    // this is stupid, but lower cloud registration frequency quickly, 30hz was probably too much
+    if (cloud_counter_ < 3)
+    {
+      cloud_counter_++;
+      return;
+    }
+    cloud_counter_ = 0;
+    
     const ros::Time& stamp = cloud_msg->header.stamp;
     Eigen::Isometry3d odom = odom2isometry(odom_msg);
     
@@ -990,7 +998,7 @@ private:
   // graph slam
   // all the below members must be accessed after locking main_thread_mutex
   std::mutex main_thread_mutex;
-
+  uint cloud_counter_ = 0;
   int max_keyframes_per_update;
   std::deque<KeyFrame::Ptr> new_keyframes;
 
